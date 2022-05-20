@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 //
@@ -64,13 +65,16 @@ func (w *worker) requestTask() {
 	// PrintTaskInfo(reqReply.Task)
 	w.task = reqReply.Task
 	// fmt.Printf("NReduce: %d\n", reqReply.Task.NReduce)
-	log.Printf("[Worker %d] Requested a task from master\n", w.task.WorkerId)
+	// log.Printf("[Worker %d] Requested a task from master\n", w.task.WorkerId)
 	if w.task.Type == MapTask {
 		w.executeMapTask()
 	} else if w.task.Type == ReduceTask {
 		w.executeReduceTask()
 	} else if w.task.Type == ExitTask {
+		log.Printf("[Worker %d] All tasks completed, exiting...", w.workerId)
 		os.Exit(0)
+	} else if w.task.Type == NoTask {
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -110,7 +114,7 @@ func (w *worker) executeMapTask() {
 		key := KV.Key
 		hashedKey := ihash(key) % mapTask.NReduce
 		if _, ok := reduceBins[hashedKey]; !ok {
-			reduceBins[hashedKey] = make([]KeyValue, len(outputKV)/mapTask.NReduce)
+			reduceBins[hashedKey] = make([]KeyValue, 0, len(outputKV)/mapTask.NReduce)
 		}
 		reduceBins[hashedKey] = append(reduceBins[hashedKey], KV)
 	}
@@ -152,9 +156,10 @@ func (w *worker) executeReduceTask() {
 	kvmap := make(map[string][]string)
 	for i := 0; i < reduceTask.NMap; i++ {
 		filepath := fmt.Sprintf("mr-%d-%d", i, assignedReduceNum)
+		// It's possible that FileDoesNotExist error occur
 		file, err := os.Open(filepath)
 		if err != nil {
-			w.handleError(err)
+			continue
 		}
 
 		dec := json.NewDecoder(file)
@@ -174,11 +179,11 @@ func (w *worker) executeReduceTask() {
 	res := make([]string, 0)
 	for key, values := range kvmap {
 		keyAgg := w.reducef(key, values)
-		res = append(res, fmt.Sprintf("%v %v", key, keyAgg))
+		res = append(res, fmt.Sprintf("%v %v\n", key, keyAgg))
 	}
 
 	outFile := fmt.Sprintf("mr-out-%d", assignedReduceNum)
-	err = ioutil.WriteFile(outFile, []byte(strings.Join(res, "\n")), 0600)
+	err = ioutil.WriteFile(outFile, []byte(strings.Join(res, "")), 0600)
 	if err != nil {
 		w.handleError(err)
 	}

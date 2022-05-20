@@ -52,13 +52,16 @@ type Coordinator struct {
 }
 
 func (c *Coordinator) FindNextTask() *TaskInfo {
+	noTask := TaskInfo{NoTask, NotStarted, "", -1, -1, c.nMap, c.nReduce}
+	// #TODO Only start reduce when maps are all executed
 	if c.nMapLeft > 0 {
 		for i := 0; i < c.nMap; i++ {
 			if c.taskArray[i].Status == NotStarted && c.taskArray[i].Type == MapTask {
 				return &c.taskArray[i]
 			}
 		}
-		// nMapLeft decremented when task finishes, will panic when all tasks are assigned but not finished
+		// all map tasks are being run
+		return &noTask
 		// panic("Cannot find available map task")
 	} else if c.nReduceLeft > 0 {
 		for i := c.nMap; i < len(c.taskArray); i++ {
@@ -66,14 +69,14 @@ func (c *Coordinator) FindNextTask() *TaskInfo {
 				return &c.taskArray[i]
 			}
 		}
+		return &noTask
 		// panic("Cannot find available reduce task")
 	} else {
 		// Assuming no tasks fail, return exit task when no task available
 		exitTask := TaskInfo{ExitTask, NotStarted, "", -1, -1, c.nMap, c.nReduce}
 		return &exitTask
 	}
-	noTask := TaskInfo{NoTask, NotStarted, "", -1, -1, c.nMap, c.nReduce}
-	return &noTask
+
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -84,10 +87,11 @@ func (c *Coordinator) AssignTask(args *RequestTaskArgs, reply *RequestTaskRespon
 	c.mu.Lock()
 
 	newTask := c.FindNextTask()
-	c.mu.Unlock()
 
 	newTask.WorkerId = workerId
 	newTask.Status = Running
+
+	c.mu.Unlock()
 
 	reply.Task = newTask
 	// PrintTaskInfo(reply.Task)
@@ -100,6 +104,7 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 	if args.Status == Failed {
 		c.taskArray[args.TaskId].Status = NotStarted
 	} else if args.Status == Completed {
+		c.taskArray[args.TaskId].Status = Completed
 		if args.Type == MapTask {
 			c.nMapLeft -= 1
 		} else if args.Type == ReduceTask {
@@ -143,8 +148,9 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
+	c.mu.Lock()
 	ret = c.nMapLeft == 0 && c.nReduceLeft == 0
-
+	c.mu.Unlock()
 	return ret
 }
 
