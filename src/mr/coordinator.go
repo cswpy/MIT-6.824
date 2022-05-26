@@ -8,10 +8,13 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 )
 
 type TaskType int
 type TaskStatus int
+
+const timeout = 10
 
 // TaskType Initialization
 const (
@@ -53,10 +56,9 @@ type Coordinator struct {
 
 func (c *Coordinator) FindNextTask() *TaskInfo {
 	noTask := TaskInfo{NoTask, NotStarted, "", -1, -1, c.nMap, c.nReduce}
-	// #TODO Only start reduce when maps are all executed
 	if c.nMapLeft > 0 {
 		for i := 0; i < c.nMap; i++ {
-			if c.taskArray[i].Status == NotStarted && c.taskArray[i].Type == MapTask {
+			if c.taskArray[i].Status == NotStarted {
 				return &c.taskArray[i]
 			}
 		}
@@ -65,7 +67,7 @@ func (c *Coordinator) FindNextTask() *TaskInfo {
 		// panic("Cannot find available map task")
 	} else if c.nReduceLeft > 0 {
 		for i := c.nMap; i < len(c.taskArray); i++ {
-			if c.taskArray[i].Status == NotStarted && c.taskArray[i].Type == ReduceTask {
+			if c.taskArray[i].Status == NotStarted {
 				return &c.taskArray[i]
 			}
 		}
@@ -77,6 +79,23 @@ func (c *Coordinator) FindNextTask() *TaskInfo {
 		return &exitTask
 	}
 
+}
+
+func (c *Coordinator) checkWorkerPulse(ti *TaskInfo) {
+	if ti.Type != MapTask && ti.Type != ReduceTask {
+		return
+	}
+
+	<-time.After(timeout * time.Second)
+
+	c.mu.Lock()
+
+	if ti.Status != Completed {
+		ti.Status = NotStarted
+		log.Printf("[Coordinator] Worker %v timed out, restarting task...", ti.WorkerId)
+		ti.WorkerId = -1
+	}
+	c.mu.Unlock()
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -91,10 +110,12 @@ func (c *Coordinator) AssignTask(args *RequestTaskArgs, reply *RequestTaskRespon
 	newTask.WorkerId = workerId
 	newTask.Status = Running
 
+	reply.Task = newTask
 	c.mu.Unlock()
 
-	reply.Task = newTask
-	// PrintTaskInfo(reply.Task)
+	// Check worker pulse after timeout
+	go c.checkWorkerPulse(newTask)
+
 	return nil
 }
 
@@ -104,11 +125,15 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 	if args.Status == Failed {
 		c.taskArray[args.TaskId].Status = NotStarted
 	} else if args.Status == Completed {
-		c.taskArray[args.TaskId].Status = Completed
-		if args.Type == MapTask {
-			c.nMapLeft -= 1
-		} else if args.Type == ReduceTask {
-			c.nReduceLeft -= 1
+		// Only admit the worker who first completed the task
+		if c.taskArray[args.TaskId].Status == Running {
+			c.taskArray[args.TaskId].Status = Completed
+			log.Printf("[Coordinator] Task %d completed by %d\n", args.TaskId, args.WorkerId)
+			if args.Type == MapTask {
+				c.nMapLeft -= 1
+			} else if args.Type == ReduceTask {
+				c.nReduceLeft -= 1
+			}
 		}
 	}
 	return nil
@@ -151,6 +176,9 @@ func (c *Coordinator) Done() bool {
 	c.mu.Lock()
 	ret = c.nMapLeft == 0 && c.nReduceLeft == 0
 	c.mu.Unlock()
+	if ret {
+		log.Println("[Coordinator] All tasks finished, exiting...")
+	}
 	return ret
 }
 

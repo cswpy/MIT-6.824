@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -20,6 +21,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 type worker struct {
 	workerId int
@@ -73,9 +82,10 @@ func (w *worker) requestTask() {
 	} else if w.task.Type == ExitTask {
 		log.Printf("[Worker %d] All tasks completed, exiting...", w.workerId)
 		os.Exit(0)
-	} else if w.task.Type == NoTask {
-		time.Sleep(200 * time.Millisecond)
 	}
+
+	time.Sleep(200 * time.Millisecond)
+
 }
 
 func (w *worker) handleError(err error) {
@@ -119,24 +129,36 @@ func (w *worker) executeMapTask() {
 		reduceBins[hashedKey] = append(reduceBins[hashedKey], KV)
 	}
 
-	var outFilePath string
 	for reduceId, KVpairs := range reduceBins {
-		outFilePath = fmt.Sprintf("mr-%d-%d", mapTask.TaskId, reduceId)
-		file, err := os.Create(outFilePath)
-		if err != nil {
-			w.handleError(err)
-		}
-		enc := json.NewEncoder(file)
-		for _, kv := range KVpairs {
-			err := enc.Encode(kv)
-			if err != nil {
-				w.handleError(err)
-			}
-		}
+		// sort.Sort(ByKey(KVpairs))
+		w.writeMapOutput(reduceId, KVpairs)
 	}
 
 	w.task.Status = Completed
 	w.reportTask()
+}
+
+func (w *worker) writeMapOutput(reduceId int, KVpairs []KeyValue) {
+	// Creating a temp file using a bogus name
+	tempFilename := fmt.Sprintf("temp-mr-%v-%v-%v", w.task.TaskId, reduceId, w.workerId)
+	file, err := os.Create(tempFilename)
+	if err != nil {
+		w.handleError(err)
+	}
+
+	buf := bufio.NewWriter(file)
+	enc := json.NewEncoder(buf)
+	for _, kv := range KVpairs {
+		err := enc.Encode(kv)
+		if err != nil {
+			w.handleError(err)
+		}
+	}
+	buf.Flush()
+
+	// Atomically renames the fie
+	newFilename := fmt.Sprintf("mr-%v-%v", w.task.TaskId, reduceId)
+	os.Rename(tempFilename, newFilename)
 }
 
 func (w *worker) executeReduceTask() {
@@ -169,26 +191,40 @@ func (w *worker) executeReduceTask() {
 				break
 			}
 			if _, ok := kvmap[kv.Key]; !ok {
-				kvmap[kv.Key] = make([]string, 0, reduceTask.NMap)
+				kvmap[kv.Key] = make([]string, 0, 100)
 			}
 			kvmap[kv.Key] = append(kvmap[kv.Key], kv.Value)
 		}
 	}
 
 	// Iterating the kvmap to call reducef once for each key-values pair
-	res := make([]string, 0)
+	res := make([]string, 0, 100)
 	for key, values := range kvmap {
 		keyAgg := w.reducef(key, values)
 		res = append(res, fmt.Sprintf("%v %v\n", key, keyAgg))
 	}
 
-	outFile := fmt.Sprintf("mr-out-%d", assignedReduceNum)
-	err = ioutil.WriteFile(outFile, []byte(strings.Join(res, "")), 0600)
+	w.writeReduceOutput(assignedReduceNum, strings.Join(res, ""))
+	w.task.Status = Completed
+	w.reportTask()
+}
+
+func (w *worker) writeReduceOutput(reduceId int, contents string) {
+	// Creating a temp file using a bogus name
+	tempFilename := fmt.Sprintf("temp-mr-out-%v-%v", reduceId, w.workerId)
+	_, err := os.Create(tempFilename)
 	if err != nil {
 		w.handleError(err)
 	}
-	w.task.Status = Completed
-	w.reportTask()
+
+	err = ioutil.WriteFile(tempFilename, []byte(contents), 0600)
+	if err != nil {
+		w.handleError(err)
+	}
+
+	// Atomically renames the fie
+	newFilename := fmt.Sprintf("mr-out-%d", reduceId)
+	os.Rename(tempFilename, newFilename)
 }
 
 func printKeyValue(kv []KeyValue) {
