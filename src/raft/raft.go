@@ -19,8 +19,12 @@ package raft
 
 import (
 	//	"bytes"
+
+	"fmt"
 	"log"
 	"math/rand"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,10 +33,10 @@ import (
 	"6.824/labrpc"
 )
 
-func init() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	rand.Seed(time.Now().Unix())
-}
+// func init() {
+// 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+// 	rand.Seed(time.Now().Unix())
+// }
 
 type ServerRole int
 
@@ -41,6 +45,73 @@ const (
 	Candidate
 	Leader
 )
+
+const HeartbeatTimeout = 150 // Milliseconds
+
+type logTopic string
+
+const (
+	dClient  logTopic = "CLNT"
+	dCommit  logTopic = "CMIT"
+	dDrop    logTopic = "DROP"
+	dError   logTopic = "ERRO"
+	dInfo    logTopic = "INFO"
+	dLeader  logTopic = "LEAD"
+	dLog     logTopic = "LOG1"
+	dLog2    logTopic = "LOG2"
+	dPersist logTopic = "PERS"
+	dSnap    logTopic = "SNAP"
+	dTerm    logTopic = "TERM"
+	dTest    logTopic = "TEST"
+	dTimer   logTopic = "TIMR"
+	dTrace   logTopic = "TRCE"
+	dVote    logTopic = "VOTE"
+	dWarn    logTopic = "WARN"
+)
+
+// // Debugging
+// const Debug = false
+
+// func DPrintf(format string, a ...interface{}) (n int, err error) {
+// 	if Debug {
+// 		log.Printf(format, a...)
+// 	}
+// 	return
+// }
+
+// Retrieve the verbosity level from an environment variable
+func getVerbosity() int {
+	v := os.Getenv("VERBOSE")
+	level := 0
+	if v != "" {
+		var err error
+		level, err = strconv.Atoi(v)
+		if err != nil {
+			log.Fatalf("Invalid verbosity %v", v)
+		}
+	}
+	return level
+}
+
+var debugStart time.Time
+var debugVerbosity int
+
+func init() {
+	debugVerbosity = getVerbosity()
+	debugStart = time.Now()
+
+	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
+}
+
+func Debug(topic logTopic, format string, a ...interface{}) {
+	if debugVerbosity >= 1 {
+		time := time.Since(debugStart).Microseconds()
+		time /= 1000
+		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
+		format = prefix + format
+		log.Printf(format, a...)
+	}
+}
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -100,11 +171,11 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// Leader election related states
-	currentTerm    int
-	votedFor       int // when votedFor is -1, it means it's a null field (has not voted yet)
-	serverRole     ServerRole
-	electionTimer  time.Timer
-	heartBeatTimer time.Timer
+	currentTerm int
+	votedFor    int // when votedFor is -1, it means it's a null field (has not voted yet)
+	serverRole  ServerRole
+	lastReset   time.Time
+	receivedHBT bool
 
 	// States
 	logs []LogEntry
@@ -117,6 +188,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.serverRole == Leader {
 		isleader = true
 	}
@@ -209,6 +282,8 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
@@ -233,9 +308,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+	Debug(dInfo, "S%d Received HBT", rf.me)
+
 	reply.Success = false
-	if args.Term < rf.currentTerm {
+	if args.Term < reply.Term {
 		return
 	}
 
@@ -245,57 +324,67 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Overwrite if conflicting
 
 	// Append new entries
-	if args.Term > rf.currentTerm {
+	rf.receivedHBT = true
+	rf.lastReset = time.Now()
+	if args.Term > reply.Term {
 		rf.currentTerm = args.Term
 	}
 	rf.changeRole(Follower)
-	log.Printf("[Hearbeat received] by %d, term: %d", rf.me, rf.currentTerm)
 	reply.Success = true
 
 }
 
 func (rf *Raft) startElection() {
-	log.Printf("[Election started] by server %d", rf.me)
+	Debug(dVote, "S%d Started election", rf.me)
 	rf.votedFor = rf.me
 	votesGranted := 1
 	args := &RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
 	}
+	ch := make(chan bool, len(rf.peers))
 	for ind := range rf.peers {
 		if ind != rf.me {
-			go func(ind int) {
+			go func(ind int, ch chan bool) {
 				reply := &RequestVoteReply{}
 				rf.sendRequestVote(ind, args, reply)
-				log.Printf("[Vote received] from %d for %d's election: %t", ind, rf.me, reply.VoteGranted)
-				if reply.VoteGranted {
-					votesGranted += 1
-					if votesGranted > len(rf.peers)/2 {
-						log.Printf("[Leader elected in Term %d] as server %d", rf.currentTerm, rf.me)
-						rf.mu.Lock()
-						rf.changeRole(Leader)
-						rf.mu.Unlock()
-					}
-				}
-			}(ind)
+				ch <- reply.VoteGranted
+				Debug(dVote, "S%d <- S%d Got vote", rf.me, ind)
+			}(ind, ch)
 		}
 	}
+
+	votesReceived := 1
+	for {
+		v := <-ch
+		votesReceived += 1
+		if v {
+			votesGranted += 1
+		}
+		if votesGranted > len(rf.peers)/2 || votesReceived-votesGranted > len(rf.peers)/2 {
+			break
+		}
+	}
+	if rf.serverRole == Candidate && votesGranted > len(rf.peers)/2 {
+		Debug(dLeader, "S%d Achieved majority in T%d (%d), converting to Leader", rf.me, rf.currentTerm, votesGranted)
+		rf.changeRole(Leader)
+	}
+
 }
 
 func (rf *Raft) startAppendEntries() {
-	log.Printf("[Heartbeat round] initiated by %d", rf.me)
+	Debug(dTimer, "S%d Broadcast HBT", rf.me)
 	args := &AppendEntriesArgs{
 		Term:     rf.currentTerm,
 		LeaderId: rf.me,
 	}
-	if rf.serverRole == Leader {
-		for ind := range rf.peers {
-			if ind != rf.me {
-				go func(ind int) {
-					reply := &AppendEntriesReply{}
-					rf.sendAppendEntries(ind, args, reply)
-				}(ind)
-			}
+
+	for ind := range rf.peers {
+		if ind != rf.me {
+			go func(ind int) {
+				reply := &AppendEntriesReply{}
+				rf.sendAppendEntries(ind, args, reply)
+			}(ind)
 		}
 	}
 }
@@ -344,19 +433,19 @@ func (rf *Raft) changeRole(newRole ServerRole) {
 	case Follower:
 		{
 			rf.serverRole = Follower
-			rf.electionTimer.Reset(getRandomElectionTimeout())
 		}
 	case Candidate:
 		{
 			rf.serverRole = Candidate
 			rf.currentTerm += 1
-			rf.electionTimer.Reset(getRandomElectionTimeout())
+			rf.lastReset = time.Now()
+			rf.startElection()
 		}
 	case Leader:
 		{
+			rf.lastReset = time.Now()
 			rf.serverRole = Leader
 			rf.startAppendEntries()
-			rf.heartBeatTimer = *time.NewTimer(getHeartbeatTimeout())
 		}
 	}
 }
@@ -408,12 +497,9 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func getRandomElectionTimeout() time.Duration {
-	return time.Duration(300+rand.Intn(301)) * time.Millisecond
-}
-
-func getHeartbeatTimeout() time.Duration {
-	return time.Duration(150) * time.Millisecond
+func getRandomElectionTimeout() int {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	return 200 + r.Intn(501)
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -424,22 +510,22 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		select {
-		case <-rf.electionTimer.C:
-			{
-				log.Printf("[Election timeout] by server %d", rf.me)
-				rf.mu.Lock()
-				rf.currentTerm += 1
-				rf.startElection()
-				rf.electionTimer.Reset(getRandomElectionTimeout())
-				rf.mu.Unlock()
+		rf.mu.Lock()
+		timeElapsed := time.Since(rf.lastReset)
+		eto := getRandomElectionTimeout()
+		switch rf.serverRole {
+		case Follower, Candidate:
+			if timeElapsed.Milliseconds() > int64(eto) {
+				Debug(dTimer, "S%d Election timeout: %v>%v", rf.me, timeElapsed, eto)
+				rf.changeRole(Candidate)
 			}
-		case <-rf.heartBeatTimer.C:
-			{
-				log.Printf("[Heartbeat] sent by server %d", rf.me)
+		case Leader:
+			if timeElapsed > HeartbeatTimeout {
+				Debug(dTimer, "S%d Broadcasting HBT", rf.me)
 				rf.startAppendEntries()
 			}
 		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -460,8 +546,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.lastReset = time.Now()
 	rf.currentTerm = 0
-	rf.electionTimer = *time.NewTimer(getRandomElectionTimeout())
 	rf.votedFor = -1
 
 	// Your initialization code here (2A, 2B, 2C).
